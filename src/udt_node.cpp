@@ -26,66 +26,9 @@
 
 #include <v8.h>
 
-#include <errno.h>
-#include <string.h>
-#include <stdlib.h>
-
-#include <sys/types.h>
-#include <unistd.h>
-#include <fcntl.h>
-
-#ifdef __MINGW32__
-# include <platform_win32.h>
-# include <platform_win32_winsock.h>
-#endif
-
-#ifdef __POSIX__
-# include <sys/ioctl.h>
-# include <sys/socket.h>
-# include <sys/un.h>
-# include <arpa/inet.h> /* inet_pton */
-# include <netdb.h>
-# include <netinet/in.h>
-# include <netinet/tcp.h>
-#endif
-
-#ifdef __linux__
-# include <linux/sockios.h> /* For the SIOCINQ / FIONREAD ioctl */
-#endif
-
-/* Non-linux platforms like OS X define this ioctl elsewhere */
-#ifndef FIONREAD
-# include <sys/filio.h>
-#endif
-
-#ifdef __OpenBSD__
-# include <sys/uio.h>
-#endif
-
-/*
- * HACK to use inet_pton/inet_ntop from c-ares because mingw32 doesn't have it
- * This trick is used in node_ares.cc as well
- * TODO fixme
- */
-#ifdef __MINGW32__
-  extern "C" {
-#   include <inet_net_pton.h>
-#   include <inet_ntop.h>
-  }
-
-# define inet_pton ares_inet_pton
-# define inet_ntop ares_inet_ntop
-#endif
-
-// SHUT_* constants aren't available on windows but there are 1:1 equivalents
-#ifdef __MINGW32__
-# define SHUT_RD   SD_RECEIVE
-# define SHUT_WR   SD_SEND
-# define SHUT_RDWR SD_BOTH
-#endif
+#include "udt.h"
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
-
 
 namespace node {
 
@@ -113,86 +56,13 @@ static Persistent<FunctionTemplate> recv_msg_template;
   }
 
 
-static inline bool SetCloseOnExec(int fd) {
-#ifdef __POSIX__
-  return (fcntl(fd, F_SETFD, FD_CLOEXEC) != -1);
-#else // __MINGW32__
-  return SetHandleInformation(reinterpret_cast<HANDLE>(_get_osfhandle(fd)),
-                              HANDLE_FLAG_INHERIT, 0) != 0;
-#endif
+static inline bool SetSockFlags(UDTSOCKET socket) {
+  bool flags = true;
+  UDT::setsockopt(sock, 0, UDT_REUSEADDR, (const char *)&flags, sizeof(flags));
+  UDT::setsockopt(sock, 0, UDT_SNDSYN, (const char *)&flags, sizeof(flags));
+  UDT::setsockopt(sock, 0, UDT_RCVSYN, (const char *)&flags, sizeof(flags));
+  return 0;
 }
-
-
-static inline bool SetNonBlock(int fd) {
-#ifdef __MINGW32__
-  unsigned long value = 1;
-  return (ioctlsocket(_get_osfhandle(fd), FIONBIO, &value) == 0);
-#else // __POSIX__
-  return (fcntl(fd, F_SETFL, O_NONBLOCK) != -1);
-#endif
-}
-
-
-static inline bool SetSockFlags(int fd) {
-#ifdef __MINGW32__
-  BOOL flags = TRUE;
-  setsockopt(_get_osfhandle(fd), SOL_SOCKET, SO_REUSEADDR, (const char *)&flags, sizeof(flags));
-#else // __POSIX__
-  int flags = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-#endif
-  return SetNonBlock(fd) && SetCloseOnExec(fd);
-}
-
-
-#ifdef __POSIX__
-
-// Creates nonblocking pipe
-static Handle<Value> Pipe(const Arguments& args) {
-  HandleScope scope;
-  int fds[2];
-
-  if (pipe(fds) < 0) return ThrowException(ErrnoException(errno, "pipe"));
-
-  if (!SetSockFlags(fds[0]) || !SetSockFlags(fds[1])) {
-    int fcntl_errno = errno;
-    close(fds[0]);
-    close(fds[1]);
-    return ThrowException(ErrnoException(fcntl_errno, "fcntl"));
-  }
-
-  Local<Array> a = Array::New(2);
-  a->Set(Integer::New(0), Integer::New(fds[0]));
-  a->Set(Integer::New(1), Integer::New(fds[1]));
-  return scope.Close(a);
-}
-
-
-// Creates nonblocking socket pair
-static Handle<Value> SocketPair(const Arguments& args) {
-  HandleScope scope;
-
-  int fds[2];
-
-  // XXX support SOCK_DGRAM?
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0) {
-    return ThrowException(ErrnoException(errno, "socketpair"));
-  }
-
-  if (!SetSockFlags(fds[0]) || !SetSockFlags(fds[1])) {
-    int fcntl_errno = errno;
-    close(fds[0]);
-    close(fds[1]);
-    return ThrowException(ErrnoException(fcntl_errno, "fcntl"));
-  }
-
-  Local<Array> a = Array::New(2);
-  a->Set(Integer::New(0), Integer::New(fds[0]));
-  a->Set(Integer::New(1), Integer::New(fds[1]));
-  return scope.Close(a);
-}
-
-#endif
 
 
 // Creates a new non-blocking socket fd
@@ -205,75 +75,43 @@ static Handle<Value> Socket(const Arguments& args) {
   // default to TCP
   int domain = PF_INET;
   int type = SOCK_STREAM;
-#ifdef SO_REUSEPORT
-  bool set_reuseport = false;
-#endif
 
   if (args[0]->IsString()) {
     String::Utf8Value t(args[0]->ToString());
     // FIXME optimize this cascade.
     if (0 == strcasecmp(*t, "TCP")) {
-      domain = PF_INET;
+      domain = AF_INET;
       type = SOCK_STREAM;
     } else if (0 == strcasecmp(*t, "TCP4")) {
-      domain = PF_INET;
+      domain = AF_INET;
       type = SOCK_STREAM;
     } else if (0 == strcasecmp(*t, "TCP6")) {
-      domain = PF_INET6;
+      domain = AF_INET6;
       type = SOCK_STREAM;
-    } else if (0 == strcasecmp(*t, "UNIX")) {
-      domain = PF_UNIX;
-      type = SOCK_STREAM;
-    } else if (0 == strcasecmp(*t, "UNIX_DGRAM")) {
-      domain = PF_UNIX;
-      type = SOCK_DGRAM;
     } else if (0 == strcasecmp(*t, "UDP")) {
-      domain = PF_INET;
+      domain = AF_INET;
       type = SOCK_DGRAM;
-#ifdef SO_REUSEPORT
-      set_reuseport = true;
-#endif
     } else if (0 == strcasecmp(*t, "UDP4")) {
-      domain = PF_INET;
+      domain = AF_INET;
       type = SOCK_DGRAM;
-#ifdef SO_REUSEPORT
-      set_reuseport = true;
-#endif
     } else if (0 == strcasecmp(*t, "UDP6")) {
-      domain = PF_INET6;
+      domain = AF_INET6;
       type = SOCK_DGRAM;
-#ifdef SO_REUSEPORT
-      set_reuseport = true;
-#endif
     } else {
       return ThrowException(Exception::Error(
             String::New("Unknown socket type.")));
     }
   }
 
-#ifdef __POSIX__
-  int fd = socket(domain, type, 0);
-#else // __MINGW32__
-  int fd = _open_osfhandle(socket(domain, type, 0), 0);
-#endif
+  UDTSOCKET sock = UDT::socket(domain, type, 0);
 
-  if (fd < 0) return ThrowException(ErrnoException(errno, "socket"));
+  if (sock == UDT::INVALID_SOCK) return ThrowException(ErrnoException(errno, "socket"));
 
-  if (!SetSockFlags(fd)) {
-    int fcntl_errno = errno;
-    close(fd);
+  if (!SetSockFlags(sock)) {
+    int fcntl_errno = UDT::getlasterror().getErrorCode();
+    UDT::close(sock);
     return ThrowException(ErrnoException(fcntl_errno, "fcntl"));
   }
-
-#ifdef SO_REUSEPORT
-  // needed for datagrams to be able to have multiple processes listening to
-  // e.g. broadcasted datagrams.
-  if (set_reuseport) {
-    int flags = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&flags,
-               sizeof(flags));
-  }
-#endif
 
   return scope.Close(Integer::New(fd));
 }
@@ -1733,11 +1571,6 @@ void InitNet(Handle<Object> target) {
   NODE_SET_METHOD(target, "socket", Socket);
   NODE_SET_METHOD(target, "close", Close);
   NODE_SET_METHOD(target, "shutdown", Shutdown);
-
-#ifdef __POSIX__
-  NODE_SET_METHOD(target, "pipe", Pipe);
-  NODE_SET_METHOD(target, "socketpair", SocketPair);
-#endif // __POSIX__
 
   NODE_SET_METHOD(target, "connect", Connect);
   NODE_SET_METHOD(target, "bind", Bind);
